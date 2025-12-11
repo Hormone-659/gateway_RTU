@@ -17,13 +17,26 @@
 
 from __future__ import annotations
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-from typing import Optional
+import os
 import socket
 import struct
+import subprocess
+import sys
+import tkinter as tk
+from tkinter import messagebox, ttk
+from typing import Optional
 
 from src.gateway.alarm.alarm_play.alarm_logic import SensorState, build_rtu_registers, evaluate_alarms
+
+# 新增：从 sensor 侧获取故障等级
+try:
+    from src.gateway.sensor.fault_state_bridge import (
+        get_latest_levels_for_alarm,
+        map_to_state_fields,
+    )
+except Exception:  # pragma: no cover - 如果 sensor 模块不可用，则自动禁用自动模式
+    get_latest_levels_for_alarm = None
+    map_to_state_fields = None
 
 
 RTU_IP_DEFAULT = "192.168.0.200"
@@ -37,6 +50,15 @@ class AlarmRTUWriteUI:
     def __init__(self, master: tk.Tk) -> None:
         self.master = master
         self.master.title("报警 -> RTU 写入模拟器")
+
+        # 记录 vibration_monitor_1.py 的子进程句柄（如果成功启动）
+        self._sensor_proc = None  # type: Optional[subprocess.Popen]
+
+        # 写 RTU 操作的最近日志（最多保留3条，包含当前和前两条）
+        self._rtu_log_history = []  # type: list[str]
+
+        # 尝试自动启动 vibration_monitor_1.py
+        self._start_vibration_monitor_subprocess()
 
         # 当前 TCP 连接状态（原始 Modbus TCP）
         self._sock: Optional[socket.socket] = None
@@ -66,6 +88,16 @@ class AlarmRTUWriteUI:
         # 单寄存器调试变量
         self.manual_addr = tk.StringVar(value="3501")
         self.manual_value = tk.StringVar(value="1")
+
+        # 新增：
+        # - 是否启用从传感器自动更新等级
+        # - 是否在检测到等级变化后自动写入 RTU
+        self.auto_from_sensor = tk.BooleanVar(value=False)
+        self.auto_write_rtu = tk.BooleanVar(value=False)
+
+        # 记录上一次写入 RTU 时的 SensorState（用于变化检测）
+        # 在 Python 3.8 下避免使用 X | Y 语法，简单标注为 SensorState，并允许 None 运行时赋值
+        self._last_written_state = None  # type: Optional[SensorState]
 
         self._build_ui()
 
@@ -116,6 +148,20 @@ class AlarmRTUWriteUI:
         )
         row += 1
 
+        # 新增一行：自动从传感器更新 & 自动写入 RTU
+        if get_latest_levels_for_alarm is not None and map_to_state_fields is not None:
+            ttk.Checkbutton(
+                frame,
+                text="从传感器自动更新等级",
+                variable=self.auto_from_sensor,
+            ).grid(row=row, column=0, columnspan=2, sticky="w")
+            ttk.Checkbutton(
+                frame,
+                text="检测等级变化后自动写入 RTU",
+                variable=self.auto_write_rtu,
+            ).grid(row=row, column=2, columnspan=2, sticky="w")
+            row += 1
+        # 然后再布置各个部位的 Spinbox
         self._add_level(frame, "皮带光电", self.belt_level, row)
         row += 1
         self._add_level(frame, "中部轴承", self.mid_bearing_level, row)
@@ -207,6 +253,10 @@ class AlarmRTUWriteUI:
         self.text_result = tk.Text(frame, width=80, height=18)
         self.text_result.grid(row=row, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
         frame.rowconfigure(row, weight=1)
+
+        # 在 UI 构建结束前，如果支持自动模式，则启动周期刷新
+        if get_latest_levels_for_alarm is not None and map_to_state_fields is not None:
+            self.master.after(1000, self._auto_refresh_from_sensor)
 
     def _add_level(self, parent: tk.Widget, label: str, var: tk.IntVar, row: int) -> None:
         """添加一行等级调节控件。"""
@@ -446,14 +496,17 @@ class AlarmRTUWriteUI:
             messagebox.showerror("错误", f"读取界面参数失败: {exc}")
             return
 
-        # 先计算 txt 文件写入映射（只用于展示，不在本界面真正写文件）
+        self._write_rtu_for_state(state)
+
+    def _write_rtu_for_state(self, state: SensorState) -> None:
+        """给定一个 SensorState，根据报警逻辑写入 RTU，并记录本次写入的状态。"""
+
         try:
             file_map = evaluate_alarms(state)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("错误", f"计算报警文件映射失败: {exc}")
             return
 
-        # 再计算 RTU 寄存器字典
         try:
             registers = build_rtu_registers(state)
         except Exception as exc:  # noqa: BLE001
@@ -461,6 +514,8 @@ class AlarmRTUWriteUI:
             return
 
         self._write_to_rtu(registers, file_map)
+        # 写入成功后，记录当前状态为“上一次写入状态”
+        self._last_written_state = state
 
     # ------------------------ Modbus 写入（报警整体） ------------------------
 
@@ -484,6 +539,7 @@ class AlarmRTUWriteUI:
         level2_flag = _get_flag(str(base / "level_2" / "level_2.txt"))
         level3_flag = _get_flag(str(base / "level_3" / "level_3.txt"))
 
+        # 在文本框中先清空，再写入当前报警汇总信息
         self.text_result.delete("1.0", tk.END)
         self.text_result.insert(
             tk.END,
@@ -497,6 +553,7 @@ class AlarmRTUWriteUI:
             f"  line_3.txt：{line3_flag}\n\n",
         )
 
+        # 写入寄存器明细
         self.text_result.insert(
             tk.END,
             f"准备向 RTU {self.ip_var.get().strip() or RTU_IP_DEFAULT}:{self.port_var.get().strip() or RTU_PORT_DEFAULT} 写入以下保持寄存器 (地址 -> 值)：\n\n",
@@ -511,10 +568,28 @@ class AlarmRTUWriteUI:
                 if not ok:
                     raise RuntimeError(f"写寄存器失败: 地址={addr}, 值={val}")
 
-            messagebox.showinfo("完成", "已成功写入 RTU。请在 RTU 侧核对寄存器值。")
+            # 组织一条本次写 RTU 的概要日志
+            summary = f"写 RTU 成功：目标 {self.ip_var.get().strip() or RTU_IP_DEFAULT}:{self.port_var.get().strip() or RTU_PORT_DEFAULT}，寄存器数量={len(registers)}，整体报警等级={overall_level}"
+            self._append_rtu_history(summary)
 
         except Exception as exc:  # noqa: BLE001
-            messagebox.showerror("错误", f"写入 RTU 失败: {exc}")
+            err_msg = f"写 RTU 失败：{exc}"
+            self._append_rtu_history(err_msg)
+            messagebox.showerror("错误", err_msg)
+
+    def _append_rtu_history(self, msg: str) -> None:
+        """追加一条写 RTU 的历史记录，只保留最近三条，并在文本框底部展示。"""
+
+        # 维护最近三条
+        self._rtu_log_history.append(msg)
+        if len(self._rtu_log_history) > 3:
+            self._rtu_log_history = self._rtu_log_history[-3:]
+
+        # 在现有文本下方追加一个分隔和历史三条记录
+        self.text_result.insert(tk.END, "\n---- 最近三次写 RTU 记录 ----\n")
+        for item in self._rtu_log_history:
+            self.text_result.insert(tk.END, item + "\n")
+        self.text_result.see(tk.END)
 
     # ------------------------ 恢复默认：3501-3520 清零 ------------------------
 
@@ -600,10 +675,114 @@ class AlarmRTUWriteUI:
         self._log_text("写入成功，请在 RTU 侧核对该寄存器的数值。")
         messagebox.showinfo("完成", "单寄存器写入成功。")
 
+    # 新增：周期性从 sensor 读取等级并更新界面
+    def _auto_refresh_from_sensor(self) -> None:
+        """若启用自动模式，则从 sensor.fault_state_bridge 读取最新等级并更新界面变量；
+        如启用了自动写入 RTU 且检测到等级变化，则自动根据报警逻辑写入 RTU。
+        """
+
+        try:
+            if self.auto_from_sensor.get() and get_latest_levels_for_alarm and map_to_state_fields:
+                snap = get_latest_levels_for_alarm()
+                field_levels = map_to_state_fields(snap)
+                # 将映射到的字段填入对应 IntVar
+                val = field_levels.get("crank_left_level")
+                if val is not None:
+                    self.crank_left_level.set(int(val))
+                val = field_levels.get("crank_right_level")
+                if val is not None:
+                    self.crank_right_level.set(int(val))
+                val = field_levels.get("tail_bearing_level")
+                if val is not None:
+                    self.tail_bearing_level.set(int(val))
+                val = field_levels.get("mid_bearing_level")
+                if val is not None:
+                    self.mid_bearing_level.set(int(val))
+
+                # 如果开启了“自动写入 RTU”，并且 RTU 已连接，则检查是否需要自动写入
+                if self.auto_write_rtu.get() and self._ensure_connected():
+                    current_state = self._build_state()
+                    if self._state_changed(self._last_written_state, current_state):
+                        # 这里不弹窗，直接静默写入，但在日志区打印一行提示
+                        self._log_text("[auto] 检测到传感器故障等级变化，自动写入 RTU。")
+                        self._write_rtu_for_state(current_state)
+        except Exception:
+            # 压制异常避免影响 UI 运行，如需要可在此处打印详细日志
+            pass
+
+        # 继续下一次调度
+        self.master.after(1000, self._auto_refresh_from_sensor)
+
+    # 新增：比较两个 SensorState 是否在关键字段上有变化
+    def _state_changed(self, old, new: SensorState) -> bool:
+        """判断关键字段是否发生变化。
+
+        参数：
+            old: 上一次写入的 SensorState 或 None
+            new: 当前界面构造的 SensorState
+        """
+        if old is None:
+            return True
+        # 目前只关心与振动相关的四个字段，其它字段可以按需扩展
+        watched_fields = [
+            "mid_bearing_level",
+            "tail_bearing_level",
+            "crank_left_level",
+            "crank_right_level",
+        ]
+        for f in watched_fields:
+            if getattr(old, f) != getattr(new, f):
+                return True
+        return False
+
+    def _start_vibration_monitor_subprocess(self) -> None:
+        """自动以子进程方式启动 vibration_monitor_1.py（如果能找到脚本的话）。"""
+
+        try:
+            # 计算 vibration_monitor_1.py 的路径：
+            # 当前文件位于 .../src/gateway/alarm/alarm_play/alarm_rtu_ui.py
+            # 目标文件位于 .../src/gateway/sensor/vibration_monitor_1.py
+            base_dir = os.path.dirname(os.path.dirname(__file__))  # .../src/gateway/alarm
+            src_root = os.path.dirname(base_dir)                   # .../src/gateway
+            sensor_dir = os.path.join(src_root, "sensor")         # .../src/gateway/sensor
+            vm_path = os.path.join(sensor_dir, "vibration_monitor_1.py")
+
+            if not os.path.exists(vm_path):
+                # 找不到脚本就直接返回，不影响报警 UI 使用
+                return
+
+            # 使用当前 Python 解释器启动一个新的进程运行 vibration_monitor_1.py
+            # 工作目录设置为项目 src 根目录，便于相对导入
+            project_src_root = os.path.dirname(src_root)  # .../src
+            self._sensor_proc = subprocess.Popen(
+                [sys.executable, vm_path],
+                cwd=project_src_root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP") else 0,
+            )
+        except Exception:
+            # 启动失败时静默忽略，不影响报警 UI 的其它功能
+            self._sensor_proc = None
+
+    # 在应用退出时，尝试结束 vibration_monitor_1 子进程
+    def _on_close(self) -> None:
+        try:
+            if self._sensor_proc is not None:
+                # 尝试温和结束子进程
+                self._sensor_proc.terminate()
+        except Exception:
+            pass
+        finally:
+            self.master.destroy()
+
 
 def main() -> None:
     root = tk.Tk()
     app = AlarmRTUWriteUI(root)
+    # 重新绑定关闭事件，确保退出时清理子进程
+    root.protocol("WM_DELETE_WINDOW", app._on_close)
     root.mainloop()
 
 
