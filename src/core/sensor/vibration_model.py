@@ -51,7 +51,7 @@ def default_speed_scale() -> float:
     place so future calibration only changes here.
     """
 
-    return 0.01  # raw / 100 -> mm/s by default
+    return 0.1  # raw / 10 -> mm/s (User specified /10)
 
 
 def raw_to_speed(raw: int, scale: Optional[float] = None) -> float:

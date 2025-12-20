@@ -63,8 +63,22 @@ class ModbusRtuClient:
                 stopbits=self._config.stopbits,
                 timeout=self._config.timeout,
             )
+
         if not self._client.connect():  # type: ignore[union-attr]
             raise IOError(f"Failed to open serial port {self._config.port}")
+
+        # 尝试为板载串口开启 RS485 模式 (Linux only)
+        # 必须在 connect() 之后设置，因为 connect() 会创建 socket (serial.Serial) 对象
+        if sys.platform.startswith("linux") and "ttyS" in self._config.port:
+            try:
+                import serial
+                import serial.rs485
+                # pymodbus 2.x 中，self._client.socket 就是 serial.Serial 实例
+                if hasattr(self._client, "socket") and isinstance(self._client.socket, serial.Serial):
+                    rs485_conf = serial.rs485.RS485Settings()
+                    self._client.socket.rs485_mode = rs485_conf
+            except Exception:
+                pass
 
     def close(self) -> None:
         """Close the underlying serial connection."""

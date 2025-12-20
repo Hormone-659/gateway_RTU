@@ -46,17 +46,29 @@ class SpeedThresholdEngine:
                 "Ensure it is importable in the deployment environment."
             )
         self._cfg = cfg
+        # 使用较小的窗口 (window_size=10) 以便报警能更快解除
+        # 默认是 50，导致报警消除需要 50 秒
         self._analyzer = MultiChannelThresholdAnalyzer(
-            ThresholdConfig(cfg.level1, cfg.level2, cfg.level3)
+            ThresholdConfig(
+                level1=cfg.level1,
+                level2=cfg.level2,
+                level3=cfg.level3,
+                window_size=10,      # 10个样本 (约10秒)
+                min_spike_count=3    # 只要有3个点超标就触发
+            ),
+            channels=["x", "y", "z"]
         )
 
     def evaluate_single(self, value: float) -> int:
-        """Return fault level (0~3) for a single vibration speed value."""
+        """Return fault level (0~3) for a single vibration speed value (legacy support)."""
+        # Treat single value as 'x' axis for backward compatibility or single-axis sensors
+        res = self._analyzer.update({"x": value, "y": 0.0, "z": 0.0})
+        return res.max_level
 
-        levels = self._analyzer.update({"v": value})  # type: ignore[call-arg]
-        # We expect 'v' to be the single channel; analyzer should return a dict
-        # mapping channel -> level. Fallback to 0 if not present.
-        return int(levels.get("v", 0))  # type: ignore[union-attr]
+    def evaluate_xyz(self, vx: float, vy: float, vz: float) -> int:
+        """Return max fault level (0~3) for 3-axis vibration speed values."""
+        res = self._analyzer.update({"x": vx, "y": vy, "z": vz})
+        return res.max_level
 
     def evaluate_multi(self, values: Dict[str, float]) -> Dict[str, int]:
         """Evaluate multiple named channels at once.

@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from core.modbus.rtu_client import ModbusRtuClient, RtuConfig
 from core.sensor.threshold_engine import SimpleThresholdConfig, SpeedThresholdEngine
@@ -52,20 +52,40 @@ class SensorService:
         interval: float = 1.0,
     ) -> None:
         self._client = ModbusRtuClient(RtuConfig(port=port))
-        self._engine = SpeedThresholdEngine(
-            SimpleThresholdConfig(level1=1000.0, level2=2000.0, level3=3000.0)
-        )
+
+        # Create independent threshold engines for each location
+        # 调整阈值：之前是 1000/2000/3000 太大了，单位是 mm/s
+        # 假设正常运行 < 5mm/s，故障可能在 10~20mm/s
+        cfg = SimpleThresholdConfig(level1=5.0, level2=10.0, level3=20.0)
+        self._engines = {
+            "crank_left": SpeedThresholdEngine(cfg),
+            "crank_right": SpeedThresholdEngine(cfg),
+            "tail_bearing": SpeedThresholdEngine(cfg),
+            "mid_bearing": SpeedThresholdEngine(cfg),
+        }
+
         self._unit_ids = unit_ids
         self._state_path = state_path
         self._interval = interval
         self._stop = threading.Event()
 
-    def _read_speed_from_unit(self, unit_id: int, address: int) -> float:
-        """Read a single speed value (mm/s) from a given unit and register."""
-
+    def _read_speed_xyz(self, unit_id: int, start_address: int) -> Tuple[float, float, float]:
+        """Read 3-axis speed values (mm/s) from a given unit starting at address."""
         self._client.unit_id = unit_id
-        regs = self._client.read_holding_registers(address, 1)
-        return raw_to_speed(regs[0])
+        # Read 3 registers: X, Y, Z
+        regs = self._client.read_holding_registers(start_address, 3)
+        vx = raw_to_speed(regs[0])
+        vy = raw_to_speed(regs[1])
+        vz = raw_to_speed(regs[2])
+        return vx, vy, vz
+
+    def _safe_read_xyz(self, unit_id: int, start_address: int) -> Tuple[float, float, float]:
+        """Wrapper around _read_speed_xyz that catches errors and returns 0s."""
+        try:
+            return self._read_speed_xyz(unit_id, start_address)
+        except Exception:
+            # Log could be added here, but might be too noisy if sensor is permanently offline
+            return 0.0, 0.0, 0.0
 
     def _acquire_once(self) -> SensorFaultState:
         """Read all configured locations once and compute fault levels."""
@@ -80,27 +100,37 @@ class SensorService:
             "tail_bearing": self._unit_ids.get("tail_bearing", 3),
             "mid_bearing": self._unit_ids.get("mid_bearing", 4),
         }
-        # For simplicity we reuse the same register address for all; adjust as
-        # needed to match your actual sensor register map.
-        reg_addr = 58  # VX as primary speed channel
 
-        cl_val = self._read_speed_from_unit(mapping["crank_left"], reg_addr)
-        cr_val = self._read_speed_from_unit(mapping["crank_right"], reg_addr)
-        tb_val = self._read_speed_from_unit(mapping["tail_bearing"], reg_addr)
-        mb_val = self._read_speed_from_unit(mapping["mid_bearing"], reg_addr)
+        # User requested to read addresses 1, 2, 3 for X, Y, Z
+        reg_addr = 1
 
-        cl_lvl = self._engine.evaluate_single(cl_val)
-        cr_lvl = self._engine.evaluate_single(cr_val)
-        tb_lvl = self._engine.evaluate_single(tb_val)
-        mb_lvl = self._engine.evaluate_single(mb_val)
+        # Read and evaluate Crank Left
+        cl_vx, cl_vy, cl_vz = self._safe_read_xyz(mapping["crank_left"], reg_addr)
+        cl_lvl = self._engines["crank_left"].evaluate_xyz(cl_vx, cl_vy, cl_vz)
+        cl_max = max(cl_vx, cl_vy, cl_vz)
+
+        # Read and evaluate Crank Right
+        cr_vx, cr_vy, cr_vz = self._safe_read_xyz(mapping["crank_right"], reg_addr)
+        cr_lvl = self._engines["crank_right"].evaluate_xyz(cr_vx, cr_vy, cr_vz)
+        cr_max = max(cr_vx, cr_vy, cr_vz)
+
+        # Read and evaluate Tail Bearing
+        tb_vx, tb_vy, tb_vz = self._safe_read_xyz(mapping["tail_bearing"], reg_addr)
+        tb_lvl = self._engines["tail_bearing"].evaluate_xyz(tb_vx, tb_vy, tb_vz)
+        tb_max = max(tb_vx, tb_vy, tb_vz)
+
+        # Read and evaluate Mid Bearing
+        mb_vx, mb_vy, mb_vz = self._safe_read_xyz(mapping["mid_bearing"], reg_addr)
+        mb_lvl = self._engines["mid_bearing"].evaluate_xyz(mb_vx, mb_vy, mb_vz)
+        mb_max = max(mb_vx, mb_vy, mb_vz)
 
         ts = time.time()
         return SensorFaultState(
             timestamp=ts,
-            crank_left=LocationFaultState(cl_val, cl_lvl),
-            crank_right=LocationFaultState(cr_val, cr_lvl),
-            tail_bearing=LocationFaultState(tb_val, tb_lvl),
-            mid_bearing=LocationFaultState(mb_val, mb_lvl),
+            crank_left=LocationFaultState(cl_max, cl_lvl),
+            crank_right=LocationFaultState(cr_max, cr_lvl),
+            tail_bearing=LocationFaultState(tb_max, tb_lvl),
+            mid_bearing=LocationFaultState(mb_max, mb_lvl),
         )
 
     def _write_state(self, state: SensorFaultState) -> None:
@@ -112,11 +142,21 @@ class SensorService:
 
     def run_forever(self) -> None:
         """Blocking main loop."""
+        print(f"[sensor_service] Starting acquisition loop on {self._client._config.port} (interval={self._interval}s)...", file=sys.stderr)
 
         while not self._stop.is_set():
             try:
                 state = self._acquire_once()
                 self._write_state(state)
+                # 打印心跳日志，方便调试
+                # 找出当前所有传感器中的最大值，方便观察
+                max_val = max(
+                    state.crank_left.value,
+                    state.crank_right.value,
+                    state.tail_bearing.value,
+                    state.mid_bearing.value
+                )
+                print(f"[sensor_service] Data updated. Max Vib: {max_val:.2f} mm/s", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
                 print(f"[sensor_service] Error: {exc}", file=sys.stderr)
             self._stop.wait(self._interval)
@@ -143,7 +183,13 @@ def main() -> None:
         "tail_bearing": 3,
         "mid_bearing": 4,
     }
-    service = SensorService(port="/dev/ttyS0", unit_ids=unit_ids)
+    # 用户反馈使用板载串口。
+    # 工业网关常见配置：
+    # - /dev/ttyS0: 通常是 RS232 调试口
+    # - /dev/ttyS1: 通常是 RS485 接口 1
+    # - /dev/ttyS2: 通常是 RS485 接口 2
+    # 诊断结果确认使用 /dev/ttyS2
+    service = SensorService(port="/dev/ttyS2", unit_ids=unit_ids)
     _install_signal_handlers(service)
     service.run_forever()
 

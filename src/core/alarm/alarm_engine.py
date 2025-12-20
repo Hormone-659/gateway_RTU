@@ -65,9 +65,17 @@ class AlarmEngine:
             mid_bearing_level=faults.mid_bearing,
             # ...existing code for other fields with safe defaults...
         )
-        alarm_level = evaluate_alarms(state)
+
+        # evaluate_alarms returns a file map dict, not an int. We can ignore it here
+        # as we are interested in the RTU registers.
+        _ = evaluate_alarms(state)
+
         rtu_registers = build_rtu_registers(state)
-        return int(alarm_level), {int(k): int(v) for k, v in rtu_registers.items()}
+
+        # Extract overall alarm level from register 3502 (as defined in alarm_logic)
+        overall_level = rtu_registers.get(3502, 0)
+
+        return int(overall_level), {int(k): int(v) for k, v in rtu_registers.items()}
 
 
 __all__ = ["FaultLevels", "AlarmEngine"]

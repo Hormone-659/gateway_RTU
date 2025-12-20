@@ -82,9 +82,14 @@ class AlarmService:
         self._rtu.write_registers(rtu_registers, alarm_level)
 
     def run_forever(self) -> None:
+        print(f"[alarm_service] Starting alarm evaluation loop (interval={self._interval}s)...", file=sys.stderr)
         while not self._stop.is_set():
             try:
                 self._process_once()
+                # 打印心跳日志，确保用户能看到服务在运行
+                # 注意：如果 _process_once 成功写入 RTU，rtu_comm 也会打印日志
+                # 这里打印是为了覆盖读取失败或无数据的情况
+                print(f"[alarm_service] Cycle completed at {time.time():.2f}. Next update in {self._interval}s.", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
                 print(f"[alarm_service] Error: {exc}", file=sys.stderr)
             self._stop.wait(self._interval)
@@ -103,7 +108,8 @@ def _install_signal_handlers(service: AlarmService) -> None:
 
 
 def main() -> None:
-    service = AlarmService()
+    # Update cycle to 30 seconds as requested
+    service = AlarmService(interval=30.0)
     _install_signal_handlers(service)
     service.run_forever()
 

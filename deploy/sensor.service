@@ -1,0 +1,17 @@
+[Unit]
+Description=Gateway Sensor Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gateway_RTU/src
+Environment=PYTHONPATH=/opt/gateway_RTU/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/venv38/bin/python -m services.sensor_service
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
