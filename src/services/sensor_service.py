@@ -68,11 +68,11 @@ class SensorService:
         # Create independent threshold engines for each location
         # 调整阈值：之前是 1000/2000/3000 太大了，单位是 mm/s
         # 假设正常运行 < 5mm/s，故障可能在 10~20mm/s
-        cfg = SimpleThresholdConfig(level1=5.0, level2=10.0, level3=20.0)
+        cfg = SimpleThresholdConfig(level1=2000, level2=2500, level3=3000)
 
         # Config for photoelectric sensors (adjust thresholds as needed)
         # User updated thresholds: 310, 320, 330
-        cfg_photo = SimpleThresholdConfig(level1=310.0, level2=320.0, level3=330.0)
+        cfg_photo = SimpleThresholdConfig(level1=1000.0, level2=1500.0, level3=2500.0)
 
         self._engines = {
             "crank_left": SpeedThresholdEngine(cfg),
