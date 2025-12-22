@@ -73,6 +73,58 @@ class RtuWriter:
             # 遇到异常时尝试关闭连接，下一次写入时会重新连接
             self._close_socket()
 
+    def read_holding_registers(self, address: int, count: int = 1) -> List[int]:
+        """Read holding registers from the RTU/PLC using Modbus TCP.
+
+        Parameters
+        ----------
+        address:
+            Starting engineering address (e.g. 101).
+        count:
+            Number of registers to read.
+
+        Returns
+        -------
+        List of integer values read from the registers.
+        """
+        self._ensure_connected()
+
+        # Engineering address -> PDU address
+        pdu_addr = address - 1
+
+        # PDU: func(0x03) + start_addr + count
+        pdu = struct.pack(">BHH", 0x03, pdu_addr, count)
+
+        try:
+            resp = self._send_modbus_request(pdu)
+        except Exception as exc:
+            self._append_log(f"[rtu_comm] ERROR while reading RTU: {exc}")
+            self._close_socket()
+            return []
+
+        if len(resp) < 2:
+            raise RuntimeError(f"Invalid response length for read_holding: {len(resp)}")
+
+        fc = resp[0]
+        if fc & 0x80:
+            exc_code = resp[1] if len(resp) > 1 else None
+            raise RuntimeError(
+                f"RTU exception response: func=0x{fc:02X}, exc_code={exc_code}"
+            )
+        if fc != 0x03:
+            raise RuntimeError(f"Unexpected function code in response: 0x{fc:02X}")
+
+        byte_count = resp[1]
+        if len(resp) != 2 + byte_count:
+             raise RuntimeError(f"Response length mismatch: expected {2 + byte_count}, got {len(resp)}")
+
+        values = []
+        for i in range(count):
+            val = struct.unpack(">H", resp[2 + i*2 : 4 + i*2])[0]
+            values.append(val)
+
+        return values
+
     def get_recent_logs(self) -> List[str]:
         return list(self._last_logs)
 

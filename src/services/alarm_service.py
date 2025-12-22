@@ -108,7 +108,18 @@ class AlarmService:
             elec_b=snapshot.elec_b,
             elec_c=snapshot.elec_c,
         )
-        alarm_level, rtu_registers = self._engine.evaluate(faults)
+
+        # Read current 101 value from RTU
+        current_rtu_101 = None
+        try:
+            # Read 1 register starting at 101
+            values = self._rtu.read_holding_registers(101, 1)
+            if values:
+                current_rtu_101 = values[0]
+        except Exception as e:
+            print(f"[alarm_service] Warning: Failed to read RTU 101: {e}", file=sys.stderr)
+
+        alarm_level, rtu_registers = self._engine.evaluate(faults, current_rtu_101=current_rtu_101)
 
         # === 关键修改：注入 101 寄存器逻辑 ===
         # 如果是 3 级报警，强制将 101 寄存器设为 82

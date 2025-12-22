@@ -5,9 +5,12 @@
 ## 1. 部署与更新
 
 每次修改代码后，都需要运行部署脚本来更新环境和服务。
+如果遇到脚本无法执行或格式错误，请先运行修复脚本。
 
 ```bash
 cd /opt/gateway_rtu
+python3 fix_crlf.py
+chmod +x deploy/*.sh
 sudo ./deploy/install.sh
 ```
 

@@ -13,12 +13,10 @@ from typing import Dict, Tuple
 try:
     from gateway.alarm.alarm_play.alarm_logic import (  # type: ignore
         SensorState,
-        evaluate_alarms,
         build_rtu_registers,
     )
 except Exception:  # pragma: no cover
     SensorState = None  # type: ignore
-    evaluate_alarms = None  # type: ignore
     build_rtu_registers = None  # type: ignore
 
 
@@ -48,13 +46,13 @@ class AlarmEngine:
     """Bridge between fault levels and existing alarm_logic functions."""
 
     def __init__(self) -> None:
-        if SensorState is None or evaluate_alarms is None or build_rtu_registers is None:
+        if SensorState is None or build_rtu_registers is None:
             raise RuntimeError(
                 "gateway.alarm.alarm_play.alarm_logic is not available. "
                 "Ensure it is importable in the deployment environment."
             )
 
-    def evaluate(self, faults: FaultLevels) -> Tuple[int, Dict[int, int]]:
+    def evaluate(self, faults: FaultLevels, current_rtu_101: int | None = None) -> Tuple[int, Dict[int, int]]:
         """Compute overall alarm level and RTU register map.
 
         Returns
@@ -87,9 +85,9 @@ class AlarmEngine:
 
         # evaluate_alarms returns a file map dict, not an int. We can ignore it here
         # as we are interested in the RTU registers.
-        _ = evaluate_alarms(state)
+        # _ = evaluate_alarms(state)
 
-        rtu_registers = build_rtu_registers(state)
+        rtu_registers = build_rtu_registers(state, current_rtu_101=current_rtu_101)
 
         # Extract overall alarm level from register 3502 (as defined in alarm_logic)
         overall_level = rtu_registers.get(3502, 0)

@@ -20,6 +20,8 @@ _g_101_changed_at: float | None = None
 
 # 锁存的 43501 当前值（0/1）；None 表示尚未确定
 _g_43501_latched: int | None = None
+# 锁存的 3501 当前值（0/1）；None 表示尚未确定
+_g_3501_latched: int | None = None
 
 
 # ================= 数据结构与辅助函数 =================
@@ -104,6 +106,19 @@ def _update_43501_latched() -> int | None:
     return _g_43501_latched
 
 
+def _update_3501_latched() -> int | None:
+    """仅依赖 101 的变化时间锁存 3501。"""
+    global _g_3501_latched
+    if _g_101_current in (81, 82) and _g_101_changed_at is not None:
+        elapsed = time.time() - _g_101_changed_at
+        if elapsed >= 60:
+            if _g_101_current == 82:
+                _g_3501_latched = 1
+            elif _g_101_current == 81:
+                _g_3501_latched = 0
+    return _g_3501_latched
+
+
 # ================= 核心逻辑函数 =================
 
 def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) -> Dict[int, int]:
@@ -128,7 +143,14 @@ def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) 
                 _g_101_trigger_start = None
 
     # ---------------------------------------------------------
-    # 1. 优先处理 43501 (远程/就地状态指示)
+    # 1. 优先处理 3501 (状态反馈，仅跟随 101)
+    # ---------------------------------------------------------
+    latched_3501 = _update_3501_latched()
+    if latched_3501 is not None:
+        registers[3501] = latched_3501
+
+    # ---------------------------------------------------------
+    # 2. 优先处理 43501 (远程/就地状态指示)
     # ---------------------------------------------------------
     latched_43501 = _update_43501_latched()
     if latched_43501 == 1:
@@ -138,7 +160,7 @@ def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) 
         return registers
 
     # ---------------------------------------------------------
-    # 2. 计算当前报警等级 & 中间变量
+    # 3. 计算当前报警等级 & 中间变量
     # ---------------------------------------------------------
     missing_count = _electrical_missing_count(state)
     electrical_level = 0 if missing_count <= 0 else (1 if missing_count == 1 else 2)
@@ -160,7 +182,7 @@ def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) 
         overall_alarm_level = 2
 
     # ---------------------------------------------------------
-    # 3. 填充通用状态寄存器 (3502 - 3520)
+    # 4. 填充通用状态寄存器 (3502 - 3520)
     # ---------------------------------------------------------
     registers[3502] = _clamp(overall_alarm_level, 3)
     registers[3503] = 0  # 假设刹车未接入
@@ -202,7 +224,7 @@ def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) 
     registers[3520] = 1 if _loadpos_abnormal(state) else 0
 
     # ---------------------------------------------------------
-    # 4. 控制逻辑 (101写操作) 与 状态反馈 (3501写操作)
+    # 5. 控制逻辑 (101写操作)
     # ---------------------------------------------------------
 
     # 关键标志位
@@ -215,18 +237,9 @@ def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) 
         if _g_101_trigger_start is None:
             _g_101_trigger_start = time.time()
 
-        elapsed_l3 = time.time() - _g_101_trigger_start
-
         # 动作1: 立即写入停机指令 82 (如果还没写过，且状态还没更新为停机)
-        # 为了避免总线拥堵，如果已知是82了可以不发，但为了保险起见，
-        # 如果3501还没变成1，或者当前还不是82，就发。
         if not is_stopped_state:
             registers[101] = 82
-
-        # 动作2: 计时满 60秒，将 3501 标记为 1 (停机)
-        if elapsed_l3 >= 60:
-            registers[3501] = 1
-        # 未满60秒前，3501 保持原状态 (Float)
 
     else:
         # === 场景 B: 没有三级报警 (Level 0, 1, 2) ===
@@ -235,28 +248,15 @@ def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) 
         _g_101_trigger_start = None
 
         if is_stopped_state:
-            # === 关键修正：停机锁定 (Stop Latch) ===
-            # 如果机器目前是停机状态 (101=82)，严禁自动重启！
-            # 无论现在传感器 Level 降到了 2, 1 还是 0，都必须保持 3501=1。
-            # 只有人工发送 101=81 (在步骤0处理) 才能解除此锁定。
-            registers[3501] = 1
-
             # 既然停机了，就不需要重复发 101=82，也不发 81
             if 101 in registers: del registers[101]
 
         else:
             # === 场景 C: 机器正在运行 (101=81) 且无严重故障 ===
-
-            if overall_alarm_level < 2:
-                # 只有 Level 0 或 1，且机器在运行，才确认“运行状态”
-                registers[3501] = 0
-            elif overall_alarm_level == 2:
-                # Level 2 报警：不动作。
-                # 不写 101，也不写 3501 (保持原值，通常是 0)
-                pass
+            pass
 
     # ---------------------------------------------------------
-    # 5. 43501 延迟写入逻辑 (当 latched_43501 == 0 时)
+    # 6. 43501 延迟写入逻辑 (当 latched_43501 == 0 时)
     # ---------------------------------------------------------
     if latched_43501 == 0:
         if _g_101_current == 81 and _g_101_changed_at is not None:
