@@ -12,8 +12,9 @@ both by UI code (vibration_monitor_*.py) and by background services
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict, Union
 
 try:
     # We try to import pymodbus, but we don't enforce it at import time.
@@ -52,7 +53,6 @@ class ModbusRtuClient:
 
     def connect(self) -> None:
         """Open the serial connection if not already open."""
-
         if self._client is None:
             self._client = ModbusSerialClient(
                 method="rtu",
@@ -63,7 +63,6 @@ class ModbusRtuClient:
                 stopbits=self._config.stopbits,
                 timeout=self._config.timeout,
             )
-
         if not self._client.connect():  # type: ignore[union-attr]
             raise IOError(f"Failed to open serial port {self._config.port}")
 
@@ -82,7 +81,6 @@ class ModbusRtuClient:
 
     def close(self) -> None:
         """Close the underlying serial connection."""
-
         if self._client is not None:
             try:
                 self._client.close()  # type: ignore[union-attr]
@@ -98,13 +96,7 @@ class ModbusRtuClient:
         self._config.unit_id = value
 
     def read_holding_registers(self, address: int, count: int = 1) -> List[int]:
-        """Read one or more holding registers.
-
-        :param address: Modbus register address (0-based or sensor-specific).
-        :param count: number of consecutive registers to read.
-        :return: list of register values as Python ints.
-        """
-
+        """Read one or more holding registers."""
         if self._client is None:
             self.connect()
 
@@ -118,13 +110,7 @@ class ModbusRtuClient:
         return list(result.registers)
 
     def read_input_registers(self, address: int, count: int = 1) -> List[int]:
-        """Read one or more input registers (Function 0x04).
-
-        :param address: Modbus register address (0-based or sensor-specific).
-        :param count: number of consecutive registers to read.
-        :return: list of register values as Python ints.
-        """
-
+        """Read one or more input registers (Function 0x04)."""
         if self._client is None:
             self.connect()
 
@@ -139,7 +125,6 @@ class ModbusRtuClient:
 
     def write_single_register(self, address: int, value: int) -> None:
         """Write a single holding register using Modbus function 0x06."""
-
         if self._client is None:
             self.connect()
 
@@ -153,7 +138,6 @@ class ModbusRtuClient:
 
     def write_multiple_registers(self, address: int, values: List[int]) -> None:
         """Write multiple consecutive holding registers using Modbus 0x10."""
-
         if self._client is None:
             self.connect()
 
@@ -166,6 +150,49 @@ class ModbusRtuClient:
             raise IOError(
                 f"Modbus RTU write_multiple_registers failed at {address} (len={len(values)})"
             )
+
+    # ========= 统一入口：自动选择 0x06 或 0x10 =========
+    def write_registers_auto(self, address: int, values: Union[List[int], int]) -> None:
+        """Unified API: if values is int or len==1 -> 0x06, else -> 0x10."""
+        if isinstance(values, int):
+            self.write_single_register(address, values)
+            return
+        if len(values) == 1:
+            self.write_single_register(address, values[0])
+        elif len(values) > 1:
+            self.write_multiple_registers(address, values)
+
+    # ========= 按映射自动分段写（把分散地址合并为连续块）=========
+    def write_registers_map(self, reg_map: Dict[int, int]) -> None:
+        """Write scattered addresses by merging consecutive runs into 0x10 blocks."""
+        if not reg_map:
+            return
+        items = sorted(reg_map.items())  # [(addr, val), ...] sorted by addr
+
+        start: Optional[int] = None
+        block: List[int] = []
+        prev: Optional[int] = None
+
+        for addr, val in items:
+            if start is None:
+                start = addr
+                prev = addr
+                block = [val]
+                continue
+            assert prev is not None
+            if addr == prev + 1:
+                block.append(val)
+                prev = addr
+            else:
+                # Write the previous block
+                self.write_registers_auto(start, block if len(block) > 1 else block[0])
+                # Start new block
+                start = addr
+                prev = addr
+                block = [val]
+
+        if start is not None and block:
+            self.write_registers_auto(start, block if len(block) > 1 else block[0])
 
 
 __all__ = ["RtuConfig", "ModbusRtuClient"]

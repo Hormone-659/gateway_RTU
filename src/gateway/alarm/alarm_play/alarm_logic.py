@@ -1,556 +1,310 @@
-"""网关与 RTU 报警逻辑模块。
-
-本模块只负责：
-- 建模传感器状态（SensorState）
-- 根据传感器等级、电参、载荷位移等计算 1/2/3 级报警
-- 生成需要写入各个报警 txt 文件的内容映射（"0"/"1"）
-
-实际 Modbus 读写应在其它模块中完成：
-- 从 RTU 寄存器读取数据
-- 计算各传感器当前属于哪一级（0/1/2/3）
-- 构造 SensorState 传入本模块的 evaluate_alarms()
-"""
-
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
+# ================= 全局状态变量 =================
 
-# 报警 txt 文件所在的根目录（即 alarm_level 文件夹）
+# 报警文件基础路径
 BASE_ALARM_DIR = Path(__file__).parent / "alarm_level"
 
+# 三级报警触发后用于 101 的计时（写 101=82 的触发时刻）
+_g_101_trigger_start: float | None = None
+
+# 记录 101 当前值与最近一次变更时间（用于 43501 只跟随 101 的 60 秒规则）
+# 注意：这里存储的是代码“认为”的当前状态，或者从RTU回读的状态
+_g_101_current: int | None = None
+_g_101_changed_at: float | None = None
+
+# 锁存的 43501 当前值（0/1）；None 表示尚未确定
+_g_43501_latched: int | None = None
+
+
+# ================= 数据结构与辅助函数 =================
 
 @dataclass
 class SensorState:
-    """从 RTU 抽象出来的当前状态。
-
-    *_level 字段：0/1/2/3 表示对应传感器当前达到的报警等级。
-    布尔字段：True 表示正常，False 表示缺失/异常。
-    """
-
-    # 光电 / 皮带 / 振动传感器等级（0-3）
-    belt_level: int = 0          # 皮带光电传感器等级
-    mid_bearing_level: int = 0   # 中部轴承振动等级
-    tail_bearing_level: int = 0  # 尾部轴承振动等级
-    horsehead_level: int = 0     # 驴头振动等级
-    crank_left_level: int = 0    # 左曲柄振动等级
-    crank_right_level: int = 0   # 右曲柄振动等级
-    line_level: int = 0          # 线路光电等级
-
-    # 三相电参是否正常（True=正常，False=缺失或异常）
+    belt_level: int = 0
+    mid_bearing_level: int = 0
+    tail_bearing_level: int = 0
+    horsehead_level: int = 0
+    crank_left_level: int = 0
+    crank_right_level: int = 0
+    line_level: int = 0
     elec_phase_a_ok: bool = True
     elec_phase_b_ok: bool = True
     elec_phase_c_ok: bool = True
-
-    # 载荷位移是否正常（True=正常，False=异常）
     loadpos_ok: bool = True
 
 
-# ---------------------------- 辅助判断函数 -----------------------------
-
-
 def _any_sensor_reach_level(state: SensorState, level: int) -> bool:
-    """任意一个传感器达到指定报警等级 level 即返回 True。
-
-    传感器编号及顺序按现场约定：
-    1. 曲柄销子_左  (crank_left_level)   —— 振动传感器
-    2. 曲柄销子_右  (crank_right_level)  —— 振动传感器
-    3. 尾轴承       (tail_bearing_level) —— 振动传感器
-    4. 中轴承       (mid_bearing_level)  —— 振动传感器
-    5. 驴头         (horsehead_level)    —— 光电/位移相关
-    6. 皮带光电     (belt_level)         —— 光电传感器
-
-    如需将线路光电(line_level)计入“任意传感器”，可在列表中追加。
-    """
-
     return any(
         getattr(state, name) >= level
         for name in [
-            "crank_left_level",   # 1
-            "crank_right_level",  # 2
-            "tail_bearing_level", # 3
-            "mid_bearing_level",  # 4
-            "horsehead_level",    # 5
-            "belt_level",         # 6
-            # 需要时可把线路光电也作为传感器参与
-            # "line_level",
+            "crank_left_level", "crank_right_level", "tail_bearing_level",
+            "mid_bearing_level", "horsehead_level", "belt_level",
         ]
     )
 
 
 def _any_vibration_reach_level(state: SensorState, level: int) -> bool:
-    """任意一个振动相关传感器达到指定报警等级 level 即返回 True。
-
-    振动传感器按编号顺序：1 左曲柄、2 右曲柄、3 尾轴承、4 中轴承。
-    """
-
     return any(
         getattr(state, name) >= level
         for name in [
-            "crank_left_level",   # 1
-            "crank_right_level",  # 2
-            "tail_bearing_level", # 3
-            "mid_bearing_level",  # 4
+            "crank_left_level", "crank_right_level",
+            "tail_bearing_level", "mid_bearing_level",
         ]
     )
 
 
-def _any_photoelectric_reach_level3(state: SensorState) -> bool:
-    """判断任意光电传感器（皮带 + 线路）是否达到 3 级。"""
-
-    return state.belt_level >= 3 or state.line_level >= 3
-
-
 def _belt_photoelectric_reach_level3(state: SensorState) -> bool:
-    """判断皮带光电传感器是否达到 3 级。"""
-
     return state.belt_level >= 3
 
 
 def _electrical_missing_count(state: SensorState) -> int:
-    """统计电参缺失的相数（0~3）。"""
-
-    return sum(
-        [
-            not state.elec_phase_a_ok,
-            not state.elec_phase_b_ok,
-            not state.elec_phase_c_ok,
-        ]
-    )
+    return sum([not state.elec_phase_a_ok, not state.elec_phase_b_ok, not state.elec_phase_c_ok])
 
 
 def _electrical_missing_at_least_one(state: SensorState) -> bool:
-    """电参至少缺 1 项。"""
-
     return _electrical_missing_count(state) >= 1
 
 
 def _electrical_missing_at_least_two(state: SensorState) -> bool:
-    """电参至少缺 2 项。"""
-
     return _electrical_missing_count(state) >= 2
 
 
 def _electrical_all_ok(state: SensorState) -> bool:
-    """电参三相全部正常。"""
-
     return _electrical_missing_count(state) == 0
 
 
 def _loadpos_abnormal(state: SensorState) -> bool:
-    """载荷位移异常。"""
-
     return not state.loadpos_ok
 
 
 def _loadpos_normal(state: SensorState) -> bool:
-    """载荷位移正常。"""
-
     return state.loadpos_ok
 
 
-def _logical_path(*parts: str) -> str:
-    """生成 alarm_level 目录下某个 txt 的完整路径字符串。"""
-
-    return str(BASE_ALARM_DIR.joinpath(*parts))
+def _clamp(value: int, max_val: int) -> int:
+    return max(0, min(value, max_val))
 
 
-# --------------------------- 一级报警判断 ---------------------------
+def _update_43501_latched() -> int | None:
+    """仅依赖 101 的变化时间锁存 43501。"""
+    global _g_43501_latched
+    if _g_101_current in (81, 82) and _g_101_changed_at is not None:
+        elapsed = time.time() - _g_101_changed_at
+        if elapsed >= 60:
+            if _g_101_current == 82:
+                _g_43501_latched = 1
+            elif _g_101_current == 81:
+                _g_43501_latched = 0
+    return _g_43501_latched
 
 
-def eval_level1(state: SensorState) -> Tuple[bool, Dict[str, str]]:
-    """计算一级报警是否触发，并返回 (是否触发, 需要写入的文件字典)。
+# ================= 核心逻辑函数 =================
 
-    约定：
-    - 传感器、电参、载荷到达阈值 1，就写对应的 *_1.txt 文件；
-    - 一级报警触发条件（写 level_1.txt=1）：
-        任意传感器达到阈值 1，或者电参缺 1 项，或者载荷位移异常，三者任意组合。
+def build_rtu_registers(state: SensorState, current_rtu_101: int | None = None) -> Dict[int, int]:
     """
-
-    # 是否有一级报警
-    l1_trigger = (
-        _any_sensor_reach_level(state, 1)
-        or _electrical_missing_at_least_one(state)
-        or _loadpos_abnormal(state)
-    )
-
-    files: Dict[str, str] = {}
-
-    # 一级总报警文件
-    files[_logical_path("level_1", "level_1.txt")] = "1" if l1_trigger else "0"
-
-    # 各传感器一级文件：达到阈值 1 就写 *_1.txt=1
-    files[_logical_path("level_1", "belt_1.txt")] = "1" if state.belt_level >= 1 else "0"
-    files[_logical_path("level_1", "mid_bearing_1.txt")] = (
-        "1" if state.mid_bearing_level >= 1 else "0"
-    )
-    files[_logical_path("level_1", "tail_bearing_1.txt")] = (
-        "1" if state.tail_bearing_level >= 1 else "0"
-    )
-    files[_logical_path("level_1", "horsehead_1.txt")] = (
-        "1" if state.horsehead_level >= 1 else "0"
-    )
-    files[_logical_path("level_1", "crank_left_1.txt")] = (
-        "1" if state.crank_left_level >= 1 else "0"
-    )
-    files[_logical_path("level_1", "crank_right_1.txt")] = (
-        "1" if state.crank_right_level >= 1 else "0"
-    )
-
-    # 电参 / 载荷位移一级：达到阈值 1（电参缺1项 / 载荷异常）就写 1
-    files[_logical_path("level_1", "elec_1.txt")] = (
-        "1" if _electrical_missing_at_least_one(state) else "0"
-    )
-    files[_logical_path("level_1", "loadpos_1.txt")] = (
-        "1" if _loadpos_abnormal(state) else "0"
-    )
-
-    return l1_trigger, files
-
-
-# ---------------------- 二级报警 + sensor_3 判断 --------------------
-
-
-def eval_level2_and_sensor3(state: SensorState) -> Tuple[bool, Dict[str, str]]:
-    """计算二级报警以及传感器故障文件的写入。
-
-    约定：
-    - 传感器、电参、载荷到达阈值 2，就写对应的 *_2.txt 文件；
-    - 二级报警触发条件（写 level_2.txt=1）：
-        1) 任意传感器达到阈值 2；
-        2) 电参缺 2 项；
-        3) 任意传感器达到阈值 3，且电参和载荷位移正常；
-       以上任一条件或任意组合。
-    - 当满足条件 3 时，同时写 sensor_fault.txt=1。
+    构建需要写入 RTU 的寄存器字典。
+    包含：故障停机逻辑、状态锁定逻辑、3501/43501 状态位逻辑。
     """
-
-    # 条件 1：任意传感器达到阈值 2
-    cond_sensor_lvl2 = _any_sensor_reach_level(state, 2)
-
-    # 条件 2：电参缺 2 项
-    cond_elec_two_missing = _electrical_missing_at_least_two(state)
-
-    # 条件 3：任意传感器达到阈值 3，且电参和载荷位移正常
-    any_sensor_lvl3 = _any_sensor_reach_level(state, 3)
-    cond_lvl3_but_normal = any_sensor_lvl3 and _electrical_all_ok(state) and _loadpos_normal(state)
-
-    l2_trigger = cond_sensor_lvl2 or cond_elec_two_missing or cond_lvl3_but_normal
-
-    files: Dict[str, str] = {}
-
-    # 二级总报警文件
-    files[_logical_path("level_2", "level_2.txt")] = "1" if l2_trigger else "0"
-
-    # 各传感器二级文件：达到阈值 2 就写 *_2.txt=1
-    files[_logical_path("level_2", "belt_2.txt")] = "1" if state.belt_level >= 2 else "0"
-    files[_logical_path("level_2", "mid_bearing_2.txt")] = (
-        "1" if state.mid_bearing_level >= 2 else "0"
-    )
-    files[_logical_path("level_2", "tail_bearing_2.txt")] = (
-        "1" if state.tail_bearing_level >= 2 else "0"
-    )
-    files[_logical_path("level_2", "horsehead_2.txt")] = (
-        "1" if state.horsehead_level >= 2 else "0"
-    )
-    files[_logical_path("level_2", "crank_left_2.txt")] = (
-        "1" if state.crank_left_level >= 2 else "0"
-    )
-    files[_logical_path("level_2", "crank_right_2.txt")] = (
-        "1" if state.crank_right_level >= 2 else "0"
-    )
-
-    # 电参 / 载荷二级
-    files[_logical_path("level_2", "elec_2.txt")] = (
-        "1" if _electrical_missing_at_least_two(state) else "0"
-    )
-    files[_logical_path("level_2", "loadpos_2.txt")] = (
-        "1" if _loadpos_abnormal(state) else "0"
-    )
-
-    # 传感器故障文件：任意传感器达到阈值3 且电参和载荷位移正常
-    files[_logical_path("level_2", "sensor_fault.txt")] = "1" if cond_lvl3_but_normal else "0"
-
-    return l2_trigger, files
-
-
-# --------------------------- 三级报警判断 ---------------------------
-
-
-def eval_level3(state: SensorState) -> Tuple[bool, Dict[str, str]]:
-    """计算三级报警是否触发，并返回文件写入映射。
-
-    约定：
-    - 传感器、电参、载荷到达阈值 3，就写对应的 *_3.txt 文件；
-    - 三级报警触发规则：
-        1) 皮带光电传感器达到阈值 3，且电参至少缺 1 项
-           -> 触发三级报警，写 level_3.txt、belt_all.txt；
-        2) 任意振动传感器达到阈值 3，且电参至少缺 1 项
-           -> 触发三级报警，写 level_3.txt、stick_fault.txt。
-    """
-
-    # 皮带光电 3 级 + 电参缺项
-    cond_belt_lvl3_elec_bad = _belt_photoelectric_reach_level3(state) and _electrical_missing_at_least_one(state)
-
-    # 任意振动传感器 3 级 + 电参缺项
-    cond_any_vib_lvl3_elec_bad = _any_vibration_reach_level(state, 3) and _electrical_missing_at_least_one(state)
-
-    l3_trigger = cond_belt_lvl3_elec_bad or cond_any_vib_lvl3_elec_bad
-
-    files: Dict[str, str] = {}
-
-    # 三级总报警文件
-    files[_logical_path("level_3", "level_3.txt")] = "1" if l3_trigger else "0"
-
-    # 皮带严重故障：belt_all.txt
-    files[_logical_path("level_3", "belt_all.txt")] = "1" if cond_belt_lvl3_elec_bad else "0"
-
-    # 振动严重故障：stick_fault.txt
-    files[_logical_path("level_3", "stick_fault.txt")] = "1" if cond_any_vib_lvl3_elec_bad else "0"
-
-    # 各传感器 3 级文件：达到阈值 3 就写 *_3.txt=1
-    files[_logical_path("level_3", "belt_3.txt")] = "1" if state.belt_level >= 3 else "0"
-    files[_logical_path("level_3", "mid_bearing_3.txt")] = (
-        "1" if state.mid_bearing_level >= 3 else "0"
-    )
-    files[_logical_path("level_3", "tail_bearing_3.txt")] = (
-        "1" if state.tail_bearing_level >= 3 else "0"
-    )
-    files[_logical_path("level_3", "horsehead_3.txt")] = (
-        "1" if state.horsehead_level >= 3 else "0"
-    )
-    files[_logical_path("level_3", "crank_left_3.txt")] = (
-        "1" if state.crank_left_level >= 3 else "0"
-    )
-    files[_logical_path("level_3", "crank_right_3.txt")] = (
-        "1" if state.crank_right_level >= 3 else "0"
-    )
-
-    return l3_trigger, files
-
-
-# ----------------------------- 对外公共函数 -----------------------------
-
-
-def evaluate_alarms(state: SensorState) -> Dict[str, str]:
-    """综合计算 1/2/3 级报警，返回“文件路径 -> 写入值”的字典。"""
-
-    _, f1 = eval_level1(state)
-    _, f2 = eval_level2_and_sensor3(state)
-    _, f3 = eval_level3(state)
-
-    merged: Dict[str, str] = {}
-    merged.update(f1)
-    merged.update(f2)
-    merged.update(f3)
-    return merged
-
-
-def write_alarm_files(file_map: Dict[str, str]) -> None:
-    """将报警结果写入对应 txt 文件。
-
-    仅当文件内容发生变化时才真正写磁盘，减少磁盘 IO。
-    可在轮询循环中反复调用。
-    """
-
-    for path_str, value in file_map.items():
-        path = Path(path_str)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            prev = path.read_text(encoding="utf-8") if path.exists() else None
-        except OSError:
-            prev = None
-        if prev != value:
-            path.write_text(value, encoding="utf-8")
-
-
-def build_rtu_registers(state: SensorState) -> Dict[int, int]:
-    """根据当前状态构造 RTU 保持寄存器写入字典（modbus 地址 -> 值）。
-
-    寄存器对应关系以 `RTU_address_fuc.csv` 为准，现版本为：
-
-    3501  抽油机运行状态 pumping_unit_operating_status  0=运行，1=停机
-    3502  报警等级 alarm_level                           0=正常，1/2/3 级
-    3503  刹车状态 brake_status                          0=松开，1=刹紧，2=故障
-    3504  故障类型 fault_type                            0=正常，1=皮带全断，2=光杆毛辫子断，3=传感器故障
-    3505  曲柄销子_左 left_crank_pin                     0=正常，1=故障
-    3506  曲柄销子_右 right_crank_pin                    0=正常，1=故障
-    3507  尾轴承 rear_bearing                            0=正常，1=故障
-    3508  中轴承 intermediate_bearing                    0=正常，1=故障
-    3509  驴头 horsehead                                 0=正常，1=故障
-    3510  皮带 drive_belt                                0=正常，1=故障
-    3511  三相电参 three_phase_electrical_params         0=正常，1=故障
-    3512  载荷/位移 load_and_displacement                0=正常，1=故障
-    3513  曲柄销子_左_故障等级 left_crank_pin_fault_level         0~3
-    3514  曲柄销子_右_故障等级 right_crank_pin_fault_level        0~3
-    3515  尾轴承_故障等级 rear_bearing_fault_level               0~3
-    3516  中轴承_故障等级 intermediate_bearing_fault_level       0~3
-    3517  驴头_故障等级 horsehead_fault_level                    0~3
-    3518  皮带_故障等级 drive_belt_fault_level                   0~3 (0正常，1/2/3=断1/2/3根)
-    3519  三相电参_故障等级 three_phase_electrical_param_fault_level 0=正常，1=缺1相，2=缺所有
-    3520  载荷/位移_故障等级 load_displacement_fault_level       0=正常，1=异常
-
-    返回的字典可以直接用于 Modbus TCP 单寄存器写入（功能码 06）。
-    """
+    global _g_101_trigger_start, _g_101_current, _g_101_changed_at
 
     registers: Dict[int, int] = {}
 
-    # ------------------------ 电参 / 载荷等中间量 ------------------------
+    # ---------------------------------------------------------
+    # 0. 同步 101 状态（检测外部/手动修改）
+    # ---------------------------------------------------------
+    if current_rtu_101 is not None:
+        # 如果从硬件读取到了新的 101 值（例如人工写了 81 或 82），更新内存状态
+        if _g_101_current != current_rtu_101:
+            _g_101_current = current_rtu_101
+            _g_101_changed_at = time.time()
+            # 如果人工介入（如手动启动），清除三级报警的自动计时器
+            if current_rtu_101 == 81:
+                _g_101_trigger_start = None
 
+    # ---------------------------------------------------------
+    # 1. 优先处理 43501 (远程/就地状态指示)
+    # ---------------------------------------------------------
+    latched_43501 = _update_43501_latched()
+    if latched_43501 == 1:
+        # 如果 43501 被锁定为 1，除了写 43501=1 外，不进行其他操作 (视需求而定)
+        # 这里的逻辑保持原样，只写这一项
+        registers[43501] = 1
+        return registers
+
+    # ---------------------------------------------------------
+    # 2. 计算当前报警等级 & 中间变量
+    # ---------------------------------------------------------
     missing_count = _electrical_missing_count(state)
-
-    # 电参故障等级：0=正常，1=缺1相，2=缺所有（>=2 相）
-    if missing_count <= 0:
-        electrical_level = 0
-    elif missing_count == 1:
-        electrical_level = 1
-    else:
-        electrical_level = 2
-
-    # 载荷位移等级：0=正常，1=异常
+    electrical_level = 0 if missing_count <= 0 else (1 if missing_count == 1 else 2)
     loadpos_level = 1 if _loadpos_abnormal(state) else 0
 
-    # 整体报警等级：所有传感器等级 + 电参等级 + 载荷等级 取最大值，限制在 0~3
+    # 综合报警等级
     overall_alarm_level = max(
-        0,
-        state.belt_level,
-        state.mid_bearing_level,
-        state.tail_bearing_level,
-        state.horsehead_level,
-        state.crank_left_level,
-        state.crank_right_level,
-        state.line_level,
-        electrical_level,
-        loadpos_level,
+        0, state.belt_level, state.mid_bearing_level, state.tail_bearing_level,
+        state.horsehead_level, state.crank_left_level, state.crank_right_level,
+        state.line_level, electrical_level, loadpos_level,
     )
     if overall_alarm_level > 3:
         overall_alarm_level = 3
 
-    # 特殊规则：任意传感器达到 3 级且电参、载荷位移均正常时，
-    # 整体报警按二级处理（3502 写 2），不再写 3 级。
+    # 特殊降级逻辑：如果有3级传感器报警，但电参和载荷正常，则降为2级
     any_sensor_lvl3 = _any_sensor_reach_level(state, 3)
     cond_lvl3_but_normal = any_sensor_lvl3 and _electrical_all_ok(state) and _loadpos_normal(state)
     if cond_lvl3_but_normal and overall_alarm_level >= 3:
         overall_alarm_level = 2
 
-    # 工具函数：将任意整数裁剪到 [0, max_val]
-    def _clamp(value: int, max_val: int) -> int:
-        if value < 0:
-            return 0
-        if value > max_val:
-            return max_val
-        return value
-
-    # ------------------------ 寄存器填值（0-based 地址） ------------------------
-    # 注意：下列註釋中的「modbus 地址」均來自 CSV，這裡直接使用該地址作為 key，
-    # 方便與現場 RTU / PLC 對照，不再減 1。
-
-    # 1. 抽油机运行状态 pumping_unit_operating_status，0=运行，1=停机
-    # 暂无实际信号，默认写 0 表示“运行”。如果后续接入实际信号，可在此处改写。
-    registers[3501] = 0
-
-    # 2. 报警等级 alarm_level，0=正常，1/2/3 级
+    # ---------------------------------------------------------
+    # 3. 填充通用状态寄存器 (3502 - 3520)
+    # ---------------------------------------------------------
     registers[3502] = _clamp(overall_alarm_level, 3)
+    registers[3503] = 0  # 假设刹车未接入
 
-    # 3. 刹车状态 brake_status，0=松开，1=刹紧，2=故障。目前未接入，固定 0。
-    registers[3503] = 0
-
-    # 4. 故障类型 fault_type，0=正常，1=皮带全断，2=光杆毛辫子断，3=传感器故障
+    # 故障类型判定 (3504)
     fault_type = 0
-
     any_vib_lvl3 = _any_vibration_reach_level(state, 3)
     belt_lvl3 = state.belt_level >= 3
     elec_bad = _electrical_missing_at_least_one(state)
 
-    # 皮带全断：皮带 3 级且电参异常
     if belt_lvl3 and elec_bad:
         fault_type = 1
-
-    # 任意振动 3 级且电参正常 → 二级报警场景下的“振动传感器故障”（3）
-    if any_vib_lvl3 and _electrical_all_ok(state):
+    elif any_vib_lvl3 and _electrical_all_ok(state):
         fault_type = 3
-
-    # 皮带 3 级且电参正常 → 二级报警场景下的“皮带传感器故障”（3）
-    if belt_lvl3 and _electrical_all_ok(state):
+    elif belt_lvl3 and _electrical_all_ok(state):
         fault_type = 3
-
-    # 任意振动 3 级且电参异常 → 三级报警场景下的“光杆/机械严重故障”（2）
-    if any_vib_lvl3 and elec_bad:
+    elif any_vib_lvl3 and elec_bad:
         fault_type = 2
-
     registers[3504] = fault_type
 
-    # 5. 曲柄销子_左 left_crank_pin，0=正常，1=故障（达到 1 级及以上视为故障）
+    # 详细位状态
     registers[3505] = 1 if state.crank_left_level >= 1 else 0
-
-    # 6. 曲柄销子_右 right_crank_pin
     registers[3506] = 1 if state.crank_right_level >= 1 else 0
-
-    # 7. 尾轴承 rear_bearing
     registers[3507] = 1 if state.tail_bearing_level >= 1 else 0
-
-    # 8. 中轴承 intermediate_bearing
     registers[3508] = 1 if state.mid_bearing_level >= 1 else 0
-
-    # 9. 驴头 horsehead
     registers[3509] = 1 if state.horsehead_level >= 1 else 0
-
-    # 10. 皮带 drive_belt
     registers[3510] = 1 if state.belt_level >= 1 else 0
-
-    # 11. 三相电参 three_phase_electrical_params，0=正常，1=故障（缺相数>=1 视为故障）
     registers[3511] = 1 if missing_count >= 1 else 0
-
-    # 12. 载荷、位移 load_and_displacement，0=正常，1=故障
     registers[3512] = 1 if _loadpos_abnormal(state) else 0
 
-    # 13. 曲柄销子_左_故障等级 left_crank_pin_fault_level，0~3
+    # 详细模拟量等级
     registers[3513] = _clamp(state.crank_left_level, 3)
-
-    # 14. 曲柄销子_右_故障等级 right_crank_pin_fault_level，0~3
     registers[3514] = _clamp(state.crank_right_level, 3)
-
-    # 15. 尾轴承_故障等级 rear_bearing_fault_level，0~3
     registers[3515] = _clamp(state.tail_bearing_level, 3)
-
-    # 16. 中轴承_故障等级 intermediate_bearing_fault_level，0~3
     registers[3516] = _clamp(state.mid_bearing_level, 3)
-
-    # 17. 驴头_故障等级 horsehead_fault_level，0~3
     registers[3517] = _clamp(state.horsehead_level, 3)
-
-    # 18. 皮带_故障等级 drive_belt_fault_level，0=正常，1/2/3=断 1/2/3 根
     registers[3518] = _clamp(state.belt_level, 3)
-
-    # 19. 三相电参_故障等级 three_phase_electrical_param_fault_level
-    # 0=正常，1=缺1相，2=缺所有
     registers[3519] = _clamp(electrical_level, 2)
-
-    # 20. 载荷、位移_故障等级 load_displacement_fault_level，0=正常，1=异常
     registers[3520] = 1 if _loadpos_abnormal(state) else 0
+
+    # ---------------------------------------------------------
+    # 4. 控制逻辑 (101写操作) 与 状态反馈 (3501写操作)
+    # ---------------------------------------------------------
+
+    # 关键标志位
+    is_level_3_alarm = (registers.get(3502, 0) == 3)
+    is_stopped_state = (_g_101_current == 82)  # 当前是否已处于停机状态
+
+    if is_level_3_alarm:
+        # === 场景 A: 正在发生三级报警 ===
+
+        if _g_101_trigger_start is None:
+            _g_101_trigger_start = time.time()
+
+        elapsed_l3 = time.time() - _g_101_trigger_start
+
+        # 动作1: 立即写入停机指令 82 (如果还没写过，且状态还没更新为停机)
+        # 为了避免总线拥堵，如果已知是82了可以不发，但为了保险起见，
+        # 如果3501还没变成1，或者当前还不是82，就发。
+        if not is_stopped_state:
+            registers[101] = 82
+
+        # 动作2: 计时满 60秒，将 3501 标记为 1 (停机)
+        if elapsed_l3 >= 60:
+            registers[3501] = 1
+        # 未满60秒前，3501 保持原状态 (Float)
+
+    else:
+        # === 场景 B: 没有三级报警 (Level 0, 1, 2) ===
+
+        # 清除三级报警计时器
+        _g_101_trigger_start = None
+
+        if is_stopped_state:
+            # === 关键修正：停机锁定 (Stop Latch) ===
+            # 如果机器目前是停机状态 (101=82)，严禁自动重启！
+            # 无论现在传感器 Level 降到了 2, 1 还是 0，都必须保持 3501=1。
+            # 只有人工发送 101=81 (在步骤0处理) 才能解除此锁定。
+            registers[3501] = 1
+
+            # 既然停机了，就不需要重复发 101=82，也不发 81
+            if 101 in registers: del registers[101]
+
+        else:
+            # === 场景 C: 机器正在运行 (101=81) 且无严重故障 ===
+
+            if overall_alarm_level < 2:
+                # 只有 Level 0 或 1，且机器在运行，才确认“运行状态”
+                registers[3501] = 0
+            elif overall_alarm_level == 2:
+                # Level 2 报警：不动作。
+                # 不写 101，也不写 3501 (保持原值，通常是 0)
+                pass
+
+    # ---------------------------------------------------------
+    # 5. 43501 延迟写入逻辑 (当 latched_43501 == 0 时)
+    # ---------------------------------------------------------
+    if latched_43501 == 0:
+        if _g_101_current == 81 and _g_101_changed_at is not None:
+            if time.time() - _g_101_changed_at >= 60:
+                registers[43501] = 0
 
     return registers
 
 
+# ================= 测试演示 =================
 if __name__ == "__main__":
-    # 簡單自測：構造幾種狀態，打印將要寫入的文件和值（不會真正寫入）
-    demo_states = {
-        "all_normal": SensorState(),                 # 全部正常
-        "belt_lvl1": SensorState(belt_level=1),      # 皮帶 1 級
-        "belt_lvl2": SensorState(belt_level=2),      # 皮帶 2 級
-        "belt_lvl3_normal": SensorState(belt_level=3),               # 皮帶 3 級，電參&載荷默認正常
-        "belt_lvl3_elec_bad": SensorState(belt_level=3, elec_phase_a_ok=False),  # 皮帶 3 級 + 電參缺相
-    }
+    print("--- 场景测试 ---")
 
-    for name, st in demo_states.items():
-        print(f"=== 演示狀態: {name} ===")
-        fm = evaluate_alarms(st)
-        for p, v in sorted(fm.items()):
-            print(p, "->", v)
-        # 額外打印對應的 RTU 寄存器寫入建議
-        regs = build_rtu_registers(st)
-        print("RTU registers (address -> value):")
-        for addr in sorted(regs):
-            print(f"  {addr} -> {regs[addr]}")
-        print()
+    # 1. 初始状态：机器运行中，一切正常
+    s = SensorState()
+    print("\n1. [正常运行] 读取状态 (假设 RTU 101=81)")
+    regs = build_rtu_registers(s, current_rtu_101=81)
+    print(f"   -> 写入寄存器: {regs} (预期: 3501=0)")
+
+    # 2. 突发故障：皮带断裂 (Level 3)
+    s.belt_level = 3
+    s.elec_phase_a_ok = False  # 配合一下变成3级
+    print("\n2. [突发故障] 皮带3级报警")
+    regs = build_rtu_registers(s, current_rtu_101=81)  # 还没停下来
+    print(f"   -> 写入寄存器: {regs} (预期: 101=82)")
+
+    # 3. 模拟过了一会儿，机器停了 (RTU反馈 101=82)，且时间超过60秒
+    print("\n3. [故障持续] 机器已停机，且持续60秒")
+    # 模拟时间流逝
+    if _g_101_trigger_start:
+        _g_101_trigger_start -= 61
+    regs = build_rtu_registers(s, current_rtu_101=82)
+    print(f"   -> 写入寄存器: {regs} (预期: 3501=1)")
+
+    # 4. 关键测试：机器停了导致震动消失，传感器变回正常 (Level 0)
+    s.belt_level = 0
+    s.elec_phase_a_ok = True
+    print("\n4. [幽灵重启测试] 传感器恢复正常 (Level 0)，但没人去现场复位")
+    # 注意：此时 current_rtu_101 依然是 82 (停机状态)
+    regs = build_rtu_registers(s, current_rtu_101=82)
+    print(f"   -> 写入寄存器: {regs}")
+
+    if regs.get(3501) == 1:
+        print("   ✅ 测试通过：虽然传感器正常，但由于处于停机锁定状态，3501 保持为 1，未误报运行。")
+    else:
+        print("   ❌ 测试失败：3501 被错误写成了 0！")
+
+    # 5. 人工复位
+    print("\n5. [人工启动] 操作员按下启动按钮 (RTU 变回 81)")
+    regs = build_rtu_registers(s, current_rtu_101=81)
+    print(f"   -> 写入寄存器: {regs} (预期: 3501=0)")

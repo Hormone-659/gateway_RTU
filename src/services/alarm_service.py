@@ -110,7 +110,15 @@ class AlarmService:
         )
         alarm_level, rtu_registers = self._engine.evaluate(faults)
 
+        # === 关键修改：注入 101 寄存器逻辑 ===
+        # 如果是 3 级报警，强制将 101 寄存器设为 82
+        # 这样 rtu_registers 字典里就会同时包含 3501~3520 和 101
+        if alarm_level == 3:
+            rtu_registers[101] = 82
+
         # Write to RTU and log internally.
+        # 注意：请确保 services/rtu_comm.py 中的 RtuWriter.write_registers 方法
+        # 内部调用了 client.write_registers_map(registers) 而不是旧的 write_multiple_registers
         self._rtu.write_registers(rtu_registers, alarm_level)
 
     def run_forever(self) -> None:
