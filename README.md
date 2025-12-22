@@ -25,7 +25,7 @@
     *   **频率**：每 1 秒运行一次。
     *   **职责**：通过串口（`/dev/ttyS2`, `/dev/ttyS3`）轮询所有传感器，更新状态文件 `/tmp/sensor_fault_state.json`。
 *   **报警服务 (`alarm_service`)**：
-    *   **频率**：每 10 秒运行一次。
+    *   **频率**：每 1 秒运行一次。
     *   **职责**：读取状态文件，执行复杂报警逻辑，通过 Modbus 写寄存器。
 
 ## 快速开始
@@ -39,3 +39,17 @@
     *   **`services/`**: 后台服务入口。
     *   **`core/`**: 核心业务逻辑。
 
+---
+
+## 附：实时查看 RTU 寄存器
+
+已提供纯基础实现的监控脚本（不依赖 pymodbus）：`deploy/monitor_rtu.py`
+
+- TCP 模式（每秒刷新）：
+  ```bash
+  python deploy/monitor_rtu.py --mode tcp --host 192.168.0.200 --unit 1 --ranges "40101-40108,40501-40521" --rate 1
+  ```
+- 串口 RTU 模式（需安装 pyserial）：
+  ```bash
+  python deploy/monitor_rtu.py --mode rtu --serial /dev/ttyS2 --baud 9600 --parity N --stopbits 1 --unit 1 --ranges "40101-40108,40501-40521" --rate 1
+  ```

@@ -25,7 +25,7 @@ cd /opt/gateway_rtu/deploy
 journalctl -u sensor.service -f
 ```
 
-**单独查看报警服务日志** (每10秒刷新，显示 RTU 写入操作)：
+**单独查看报警服务日志** (每秒刷新，显示 RTU 写入操作)：
 ```bash
 journalctl -u alarm.service -f
 ```
@@ -67,6 +67,18 @@ cd /opt/gateway_rtu/deploy
 /root/venv38/bin/python diagnose_photo.py
 ```
 
+**实时查看 RTU 寄存器** (基础实现，无 pymodbus)：
+- TCP 模式：
+  ```bash
+  cd /opt/gateway_rtu/deploy
+  /root/venv38/bin/python monitor_rtu.py --mode tcp --host 192.168.0.200 --unit 1 --ranges "43501-43520" --rate 1
+  ```
+- RTU 串口模式：
+  ```bash
+  cd /opt/gateway_rtu/deploy
+  /root/venv38/bin/python monitor_rtu.py --mode rtu --serial /dev/ttyS2 --baud 9600 --parity N --stopbits 1 --unit 1 --ranges "43501-43520" --rate 1
+  ```
+
 **手动运行采集程序** (绕过 Systemd，用于调试启动报错)：
 ```bash
 cd /opt/gateway_rtu/deploy
@@ -94,4 +106,3 @@ sudo ./debug_run.sh
 cd /opt/gateway_rtu/deploy
 sudo ./enable_autostart.sh
 ```
-

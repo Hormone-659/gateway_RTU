@@ -14,9 +14,17 @@
 *   **`diagnose_serial.py`**: 扫描系统串口，自动探测连接的 Modbus 设备参数（波特率、站号）。
 *   **`diagnose_address.py`**: 扫描指定串口的 Modbus 寄存器地址，用于确认数据位置。
 *   **`diagnose_photo.py`**: 专门用于扫描光电传感器的寄存器数值。
+*   **`monitor_rtu.py`**: 实时查看 RTU 寄存器（无 pymodbus，基础实现）。
+    - TCP：
+      ```bash
+      /root/venv38/bin/python monitor_rtu.py --mode tcp --host 192.168.0.200 --unit 1 --ranges "40101-40108,40501-40521" --rate 1
+      ```
+    - 串口 RTU（需安装 pyserial）：
+      ```bash
+      /root/venv38/bin/python monitor_rtu.py --mode rtu --serial /dev/ttyS2 --baud 9600 --parity N --stopbits 1 --unit 1 --ranges "40101-40108,40501-40521" --rate 1
+      ```
 
 ## 服务配置
 
 *   **`sensor.service`**: 采集服务的 Systemd 单元文件。
 *   **`alarm.service`**: 报警服务的 Systemd 单元文件。
-
